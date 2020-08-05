@@ -1,0 +1,146 @@
+!---+----1----+----2----+----3----+----4----+----5----+----6----+----7----+
+! GCELL.F: Ghost Cell Exchange Benchmark
+! (c)2010-2014 Seiji Nishimura
+! $Id: gcell.f,v 1.1.1.1 2020/08/05 00:00:00 seiji Exp seiji $
+!---+----1----+----2----+----3----+----4----+----5----+----6----+----7----+
+      PROGRAM GCELL
+      IMPLICIT REAL*8(A-H,O-Z)
+      INCLUDE 'mpif.h'
+!
+      INTEGER           ::NPX,NPY,MSGLEN,NPAD
+      INTEGER           ::NPROCS,MYRANK,MYROW,MYCOL,NITER
+      INTEGER           ::NUPPERX,NLOWERX,NUPPERY,NLOWERY
+      INTEGER           ::IERR
+      REAL*8            ::TSTART,TEND,MLEN
+      REAL*8            ::MBS_LOCAL,MBS_MIN,MBS_MAX,MBS_SUM
+      REAL*8,ALLOCATABLE::MSGS(:,:),MSGR(:,:)
+!
+! inline functions
+      IPROCNUM(IX,JY)=IX+JY*NPX
+      NROW(IRANK)=MOD(IRANK,NPX)
+      NCOL(IRANK)=INT(IRANK/NPX)
+!
+      CALL MPI_INIT(IERR)
+      CALL MPI_COMM_SIZE(MPI_COMM_WORLD,NPROCS,IERR)
+      CALL MPI_COMM_RANK(MPI_COMM_WORLD,MYRANK,IERR)
+!
+      IF (MYRANK.eq.0) THEN
+!         WRITE(*,*) 'PE Grid (NPX,NPY)?'
+!         WRITE(*,*) 'SIZE,PAD?'
+          READ (*,*) NPX,NPY
+          READ (*,*) MSGLEN,NPAD
+      END IF
+      CALL MPI_BCAST(NPX   ,1,MPI_INTEGER,0,MPI_COMM_WORLD,IERR)
+      CALL MPI_BCAST(NPY   ,1,MPI_INTEGER,0,MPI_COMM_WORLD,IERR)
+      CALL MPI_BCAST(MSGLEN,1,MPI_INTEGER,0,MPI_COMM_WORLD,IERR)
+      CALL MPI_BCAST(NPAD  ,1,MPI_INTEGER,0,MPI_COMM_WORLD,IERR)
+!
+      ALLOCATE(MSGS(MSGLEN+NPAD,4))
+      ALLOCATE(MSGR(MSGLEN+NPAD,4))
+!
+      IF (NPROCS.ne.NPX*NPY) THEN
+         IF (MYRANK.eq.0)
+     &      WRITE(*,100)NPROCS,NPX*NPY
+         CALL MPI_ABORT(MPI_COMM_WORLD,-1,IERR)
+      END IF
+!
+! 2D Torus Topology
+      MYROW=NROW(MYRANK)
+      MYCOL=NCOL(MYRANK)
+      NUPPERX=IPROCNUM(MOD(MYROW+NPX+1,NPX),MYCOL)
+      NLOWERX=IPROCNUM(MOD(MYROW+NPX-1,NPX),MYCOL)
+      NUPPERY=IPROCNUM(MYROW,MOD(MYCOL+NPY+1,NPY))
+      NLOWERY=IPROCNUM(MYROW,MOD(MYCOL+NPY-1,NPY))
+!
+! Touching memory pages
+      CALL RANDOM_NUMBER(MSGS)
+      CALL RANDOM_NUMBER(MSGR)
+! Rehasal Phase -----------------------------------------------------------
+      NITER=100
+!
+      CALL MPI_BARRIER(MPI_COMM_WORLD,IERR)
+      TSTART=MPI_WTIME()
+!
+      CALL EXCHANGE_GCELLS(NITER,MSGR,MSGS,MSGLEN+NPAD,MSGLEN,
+     &                     NUPPERX,NLOWERX,NUPPERY,NLOWERY)
+!
+      CALL MPI_BARRIER(MPI_COMM_WORLD,IERR)
+      TEND=MPI_WTIME()
+! Measurement Phase -------------------------------------------------------
+      NITER=INT(NITER*60.D0/(TEND-TSTART))
+      CALL MPI_BCAST(NITER,1,MPI_INTEGER,0,MPI_COMM_WORLD,IERR)
+!
+      CALL MPI_BARRIER(MPI_COMM_WORLD,IERR)
+      TSTART=MPI_WTIME()
+!
+      CALL EXCHANGE_GCELLS(NITER,MSGR,MSGS,MSGLEN+NPAD,MSGLEN,
+     &                     NUPPERX,NLOWERX,NUPPERY,NLOWERY)
+!
+      CALL MPI_BARRIER(MPI_COMM_WORLD,IERR)
+      TEND=MPI_WTIME()
+!--------------------------------------------------------------------------
+      MLEN=MSGLEN*8.D-6
+      MBS_LOCAL=8.D0*MLEN*NITER/(TEND-TSTART)
+!
+      CALL MPI_REDUCE(MBS_LOCAL,MBS_MIN,1,MPI_REAL8,MPI_MIN,0,
+     &                MPI_COMM_WORLD,IERR)
+      CALL MPI_REDUCE(MBS_LOCAL,MBS_MAX,1,MPI_REAL8,MPI_MAX,0,
+     &                MPI_COMM_WORLD,IERR)
+      CALL MPI_REDUCE(MBS_LOCAL,MBS_SUM,1,MPI_REAL8,MPI_SUM,0,
+     &                MPI_COMM_WORLD,IERR)
+!
+      IF (MYRANK.eq.0)
+     &   WRITE(*,110)NPX,NPY,MBS_MIN,MBS_MAX,MBS_SUM/NPROCS,NITER,MLEN
+!
+      DEALLOCATE(MSGR)
+      DEALLOCATE(MSGS)
+!
+!     CALL MPI_BARRIER(MPI_COMM_WORLD,IERR)
+      CALL MPI_FINALIZE(IERR)
+      STOP
+!
+ 100  FORMAT('WRONG #PE: ACTUAL=',I7,': EXPECTED=',I7)
+ 110  FORMAT('(',I3,'X',I3,'): MIN,MAX,AVG=',
+     &       3F12.3,'[MB/S] FOR ',I7,'X', F7.3,'[MB] MESSAGES')
+!
+      END
+!---+----1----+----2----+----3----+----4----+----5----+----6----+----7----+
+      SUBROUTINE EXCHANGE_GCELLS(NITER,MSGS,MSGR,LDA,MSGLEN,
+     &                           NUPPERX,NLOWERX,NUPPERY,NLOWERY)
+      IMPLICIT REAL*8(A-H,O-Z)
+      INCLUDE 'mpif.h'
+!
+      INTEGER,INTENT(IN)  ::NITER,LDA,MSGLEN,
+     &                      NUPPERX,NLOWERX,NUPPERY,NLOWERY
+      REAL*8,INTENT(INOUT)::MSGS(LDA,4),MSGR(LDA,4)
+!
+      INTEGER             ::ITAG,IERR,IREQS(4),IREQR(4)
+      INTEGER             ::ISTAT(MPI_STATUS_SIZE,4)
+!
+      ITAG=10
+!
+      DO I=1,NITER
+         CALL MPI_IRECV(MSGR(1,1),MSGLEN,MPI_REAL8,NUPPERX,ITAG,
+     &                  MPI_COMM_WORLD,IREQR(1),IERR)
+         CALL MPI_IRECV(MSGR(1,2),MSGLEN,MPI_REAL8,NLOWERX,ITAG,
+     &                  MPI_COMM_WORLD,IREQR(2),IERR)
+         CALL MPI_IRECV(MSGR(1,3),MSGLEN,MPI_REAL8,NUPPERY,ITAG,
+     &                  MPI_COMM_WORLD,IREQR(3),IERR)
+         CALL MPI_IRECV(MSGR(1,4),MSGLEN,MPI_REAL8,NLOWERY,ITAG,
+     &                  MPI_COMM_WORLD,IREQR(4),IERR)
+!
+         CALL MPI_ISEND(MSGS(1,1),MSGLEN,MPI_REAL8,NUPPERX,ITAG,
+     &                  MPI_COMM_WORLD,IREQS(1),IERR)
+         CALL MPI_ISEND(MSGS(1,2),MSGLEN,MPI_REAL8,NLOWERX,ITAG,
+     &                  MPI_COMM_WORLD,IREQS(2),IERR)
+         CALL MPI_ISEND(MSGS(1,3),MSGLEN,MPI_REAL8,NUPPERY,ITAG,
+     &                  MPI_COMM_WORLD,IREQS(3),IERR)
+         CALL MPI_ISEND(MSGS(1,4),MSGLEN,MPI_REAL8,NLOWERY,ITAG,
+     &                  MPI_COMM_WORLD,IREQS(4),IERR)
+!
+         CALL MPI_WAITALL(4,IREQR,ISTAT,IERR)
+         CALL MPI_WAITALL(4,IREQS,ISTAT,IERR)
+      ENDDO
+!
+      RETURN
+      END
